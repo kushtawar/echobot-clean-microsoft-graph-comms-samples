@@ -1,6 +1,9 @@
 using EchoBot;
 using Microsoft.Extensions.Logging.Configuration;
 using Microsoft.Extensions.Logging.EventLog;
+using System.IO;
+
+CreateDeploymentMarker();
 
 IHost host = Host.CreateDefaultBuilder(args)
     .UseWindowsService(options =>
@@ -19,3 +22,21 @@ IHost host = Host.CreateDefaultBuilder(args)
     .Build();
 
 await host.RunAsync();
+
+static void CreateDeploymentMarker()
+{
+    try
+    {
+        var folder = @"C:\speechlogs";
+        Directory.CreateDirectory(folder);
+
+        var filename = $"build-marker-{DateTime.UtcNow:yyyyMMddHHmmss}.txt";
+        var path = Path.Combine(folder, filename);
+
+        using var file = File.Create(path);
+    }
+    catch
+    {
+        // Ignore marker failures so service startup is unaffected.
+    }
+}

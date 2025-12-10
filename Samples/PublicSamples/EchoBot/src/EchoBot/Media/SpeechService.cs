@@ -151,6 +151,21 @@ namespace EchoBot.Media
                             return;
 
                         _logger.LogInformation($"RECOGNIZED: Text={e.Result.Text}");
+                        // NEW: Write transcript to C:\speechlogs\recognized.txt
+        try
+        {
+            var folder = @"C:\speechlogs";
+            Directory.CreateDirectory(folder);  // ensure folder exists
+
+            var file = Path.Combine(folder, "recognized.txt");
+            File.AppendAllText(file, $"{DateTime.UtcNow:u} - {e.Result.Text}{Environment.NewLine}");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Transcript log write failed: {ex.Message}");
+        }
+
+        // Continue with TTS
                         // We recognized the speech
                         // Now do Speech to Text
                         await TextToSpeech(e.Result.Text);

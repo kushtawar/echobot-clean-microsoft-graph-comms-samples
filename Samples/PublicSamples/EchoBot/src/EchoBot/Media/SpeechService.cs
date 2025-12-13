@@ -168,8 +168,17 @@ namespace EchoBot.Media
 
                         _logger.LogInformation($"RECOGNIZED: Text={e.Result.Text}");
                         LogRecognizedText(e.Result.Text);
-                        await RelayToVoiceEndpointAsync(e.Result.Text);
-                        await TextToSpeech(e.Result.Text);
+                        var responseBody = await RelayToVoiceEndpointAsync(e.Result.Text);
+                        var speechText = e.Result.Text;
+                        if (!string.IsNullOrWhiteSpace(responseBody))
+                        {
+                            var formatted = BuildSpeechResponse(responseBody, speechText);
+                            if (!string.IsNullOrWhiteSpace(formatted))
+                            {
+                                speechText = formatted;
+                            }
+                        }
+                        await TextToSpeech(speechText);
                     }
                     else if (e.Result.Reason == ResultReason.NoMatch)
                     {
@@ -258,11 +267,11 @@ namespace EchoBot.Media
             }
         }
 
-        private async Task RelayToVoiceEndpointAsync(string recognizedText)
+        private async Task<string?> RelayToVoiceEndpointAsync(string recognizedText)
         {
             if (string.IsNullOrWhiteSpace(_settings?.VoiceSttEndpoint))
             {
-                return;
+                return null;
             }
 
             try
@@ -277,10 +286,12 @@ namespace EchoBot.Media
                 using var response = await _httpClient.PostAsync(_settings.VoiceSttEndpoint, content).ConfigureAwait(false);
                 var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                 await LogVoiceSttResponseAsync(response.IsSuccessStatusCode, body);
+                return response.IsSuccessStatusCode ? body : null;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to call /voice/stt endpoint.");
+                return null;
             }
         }
 
@@ -296,6 +307,107 @@ namespace EchoBot.Media
             {
                 _logger.LogError(ex, "Failed to log /voice/stt response.");
             }
+        }
+
+        private string? BuildSpeechResponse(string responseBody, string fallbackRecognizedText)
+        {
+            if (string.IsNullOrWhiteSpace(responseBody))
+            {
+                return null;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(responseBody);
+                if (!doc.RootElement.TryGetProperty("result", out var resultElement))
+                {
+                    return null;
+                }
+
+                var action = TryGetString(resultElement, "action")?.ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(action))
+                {
+                    return null;
+                }
+
+                switch (action)
+                {
+                    case "ticket_create":
+                        var inc = TryGetString(resultElement, "inc_number");
+                        var reason = TryGetString(resultElement, "reason");
+                        if (!string.IsNullOrWhiteSpace(inc))
+                        {
+                            return $"I created ticket {inc} for {ReasonOrFallback(reason)}.";
+                        }
+                        if (!string.IsNullOrWhiteSpace(reason))
+                        {
+                            return $"I created a ticket for {reason}.";
+                        }
+                        return "I created a ticket for your issue.";
+
+                    case "ticket_status":
+                        var state = TryGetString(resultElement, "state");
+                        var statusInc = TryGetString(resultElement, "inc_number") ?? "the incident";
+                        var extra = TryGetString(resultElement, "short_description");
+                        if (!string.IsNullOrWhiteSpace(state) && !string.IsNullOrWhiteSpace(extra))
+                        {
+                            return $"Status for {statusInc} is {state}. {extra}";
+                        }
+                        if (!string.IsNullOrWhiteSpace(state))
+                        {
+                            return $"Status for {statusInc} is {state}.";
+                        }
+                        return $"Status for {statusInc} is not available yet.";
+
+                    case "password_reset":
+                    case "help":
+                    case "bot_profile":
+                    case "ticket_howto":
+                        var reply = TryGetString(resultElement, "text");
+                        return string.IsNullOrWhiteSpace(reply) ? fallbackRecognizedText : reply;
+
+                    case "propose_ticket":
+                        var propReason = TryGetString(resultElement, "reason") ?? "your issue";
+                        var tips = TryGetString(resultElement, "tips");
+                        if (!string.IsNullOrWhiteSpace(tips))
+                        {
+                            return $"I can create a ticket for {propReason}. {tips}";
+                        }
+                        return $"I can create a ticket for {propReason}. Should I go ahead?";
+
+                    case "legacy":
+                        var legacy = TryGetString(resultElement, "text");
+                        return string.IsNullOrWhiteSpace(legacy)
+                            ? $"You said: {fallbackRecognizedText}"
+                            : $"You said: {legacy}";
+
+                    default:
+                        return null;
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Failed to parse /voice/stt response JSON.");
+                return null;
+            }
+        }
+
+        private static string? TryGetString(JsonElement element, string propertyName)
+        {
+            if (element.TryGetProperty(propertyName, out var prop) && prop.ValueKind == JsonValueKind.String)
+            {
+                return prop.GetString();
+            }
+            return null;
+        }
+
+        private static string ReasonOrFallback(string? reason)
+        {
+            if (string.IsNullOrWhiteSpace(reason))
+            {
+                return "your issue";
+            }
+            return reason;
         }
     }
 }

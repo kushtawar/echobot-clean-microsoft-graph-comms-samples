@@ -1,7 +1,13 @@
 ﻿using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
 using Microsoft.Skype.Bots.Media;
+using System;
+using System.IO;
+using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace EchoBot.Media
 {
@@ -23,6 +29,10 @@ namespace EchoBot.Media
         /// The logger
         /// </summary>
         private readonly ILogger _logger;
+        private readonly AppSettings _settings;
+        private readonly string _callId;
+        private readonly string _logDirectory;
+        private static readonly HttpClient _httpClient = new HttpClient();
         private readonly PushAudioInputStream _audioInputStream = AudioInputStream.CreatePushStream(AudioStreamFormat.GetWaveFormatPCM(16000, 16, 1));
         private readonly AudioOutputStream _audioOutputStream = AudioOutputStream.CreatePullStream();
 
@@ -31,9 +41,15 @@ namespace EchoBot.Media
         private readonly SpeechSynthesizer _synthesizer;
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechService" /> class.
-        public SpeechService(AppSettings settings, ILogger logger)
+        public SpeechService(AppSettings settings, ILogger logger, string callId)
         {
             _logger = logger;
+            _settings = settings;
+            _callId = callId ?? string.Empty;
+            _logDirectory = string.IsNullOrWhiteSpace(settings.TranscriptionLogDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "EchoBot", "speechlogs")
+                : settings.TranscriptionLogDirectory;
+            Directory.CreateDirectory(_logDirectory);
 
             _speechConfig = SpeechConfig.FromSubscription(settings.SpeechConfigKey, settings.SpeechConfigRegion);
             _speechConfig.SpeechSynthesisLanguage = settings.BotLanguage;
@@ -151,24 +167,8 @@ namespace EchoBot.Media
                             return;
 
                         _logger.LogInformation($"RECOGNIZED: Text={e.Result.Text}");
-                        // NEW: Write transcript to C:\speechlogs\recognized.txt
-        try
-{
-    var basePath = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-    var folder = Path.Combine(basePath, "EchoBot", "speechlogs");
-    Directory.CreateDirectory(folder);
-
-    var file = Path.Combine(folder, "recognized.txt");
-    File.AppendAllText(file, $"{DateTime.UtcNow:u} - {e.Result.Text}{Environment.NewLine}");
-}
-catch (Exception ex)
-{
-    _logger.LogError($"Transcript log write failed: {ex.Message}");
-}
-
-        // Continue with TTS
-                        // We recognized the speech
-                        // Now do Speech to Text
+                        LogRecognizedText(e.Result.Text);
+                        await RelayToVoiceEndpointAsync(e.Result.Text);
                         await TextToSpeech(e.Result.Text);
                     }
                     else if (e.Result.Reason == ResultReason.NoMatch)
@@ -242,6 +242,59 @@ catch (Exception ex)
                     AudioMediaBuffers = Util.Utilities.CreateAudioMediaBuffers(stream, currentTick, _logger)
                 };
                 OnSendMediaBufferEventArgs(this, args);
+            }
+        }
+
+        private void LogRecognizedText(string text)
+        {
+            try
+            {
+                var file = Path.Combine(_logDirectory, "recognized.txt");
+                File.AppendAllText(file, $"{DateTime.UtcNow:u} - {text}{Environment.NewLine}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Transcript log write failed.");
+            }
+        }
+
+        private async Task RelayToVoiceEndpointAsync(string recognizedText)
+        {
+            if (string.IsNullOrWhiteSpace(_settings?.VoiceSttEndpoint))
+            {
+                return;
+            }
+
+            try
+            {
+                var payload = new
+                {
+                    text = recognizedText,
+                    callId = _callId
+                };
+
+                using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+                using var response = await _httpClient.PostAsync(_settings.VoiceSttEndpoint, content).ConfigureAwait(false);
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                await LogVoiceSttResponseAsync(response.IsSuccessStatusCode, body);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to call /voice/stt endpoint.");
+            }
+        }
+
+        private async Task LogVoiceSttResponseAsync(bool success, string body)
+        {
+            try
+            {
+                var file = Path.Combine(_logDirectory, "voice-stt-response.txt");
+                var line = $"{DateTime.UtcNow:u} | callId={_callId} | success={success} | {body}";
+                await File.AppendAllTextAsync(file, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to log /voice/stt response.");
             }
         }
     }

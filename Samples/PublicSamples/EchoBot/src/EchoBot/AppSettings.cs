@@ -76,6 +76,17 @@ namespace EchoBot
         /// </summary>
         public string BotLanguage { get; set; }
 
+        /// <summary>
+        /// Gets or sets the FastAPI /voice/stt endpoint (ngrok/public URL).
+        /// </summary>
+        public string VoiceSttEndpoint { get; set; }
+
+        /// <summary>
+        /// Gets or sets the directory where recognized speech/responses are logged.
+        /// Defaults to %ProgramData%\EchoBot\speechlogs.
+        /// </summary>
+        public string TranscriptionLogDirectory { get; set; }
+
         // set by dsc script
 
         /// <summary>
@@ -106,4 +117,3 @@ namespace EchoBot
         public string MediaDnsName { get; set; }
     }
 }
-

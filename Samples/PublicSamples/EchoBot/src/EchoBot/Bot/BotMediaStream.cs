@@ -20,6 +20,7 @@ using Microsoft.Graph.Communications.Common;
 using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Skype.Bots.Media;
 using Microsoft.Skype.Internal.Media.Services.Common;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace EchoBot.Bot
@@ -97,7 +98,7 @@ namespace EchoBot.Bot
 
             if (_settings.UseSpeechService)
             {
-                _languageService = new SpeechService(_settings, _logger);
+                _languageService = new SpeechService(_settings, _logger, callId);
                 _languageService.SendMediaBuffer += this.OnSendMediaBuffer;
             }
         }
@@ -246,4 +247,3 @@ namespace EchoBot.Bot
         }
     }
 }
-

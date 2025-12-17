@@ -51,6 +51,8 @@ namespace EchoBot.Media
         private Task _speechLoopTask;
         private TaskCompletionSource<bool> _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private TaskCompletionSource<bool> _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private bool _restartPending;
+        private bool _hasWelcomed;
         private long _bufferSampleCount;
         private long _bufferSampleBytes;
         private readonly object _bufferLogLock = new object();
@@ -166,6 +168,8 @@ namespace EchoBot.Media
             }
 
             _isRunning = true;
+            _hasWelcomed = false;
+            _restartPending = false;
             _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
             _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
             _speechLoopTask = Task.Run(ProcessSpeechLoopAsync);
@@ -189,6 +193,7 @@ namespace EchoBot.Media
 
                     _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
                     await ResetRecognizerAsync().ConfigureAwait(false);
+                    _restartPending = false;
                 }
             }
             catch (Exception ex)
@@ -198,6 +203,7 @@ namespace EchoBot.Media
             finally
             {
                 await ResetRecognizerAsync().ConfigureAwait(false);
+                _restartPending = false;
                 Trace("ProcessSpeechLoopAsync END");
             }
         }
@@ -283,7 +289,11 @@ namespace EchoBot.Media
                     _recognizer.SessionStarted += async (s, e) =>
                     {
                         _logger.LogInformation("\nSession started event.");
-                        await TextToSpeech("Hello");
+                        if (!_hasWelcomed)
+                        {
+                            _hasWelcomed = true;
+                            await TextToSpeech("Hello");
+                        }
                     };
 
                     _recognizer.SessionStopped += (s, e) =>
@@ -343,6 +353,19 @@ namespace EchoBot.Media
 
         private void RequestRecognizerRestart(string reason)
         {
+            if (_shutdownSignal.Task.IsCompleted)
+            {
+                Trace($"Recognizer restart ignored ({reason}) because shutdown requested");
+                return;
+            }
+
+            if (_restartPending)
+            {
+                Trace($"Recognizer restart already pending (ignore {reason})");
+                return;
+            }
+
+            _restartPending = true;
             Trace($"Recognizer restart requested ({reason})");
             _restartSignal.TrySetResult(true);
         }

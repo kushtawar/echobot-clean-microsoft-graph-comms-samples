@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace EchoBot.Media
@@ -63,6 +64,8 @@ namespace EchoBot.Media
         private readonly TimeSpan _maxRestartDelay = TimeSpan.FromSeconds(5);
         private TimeSpan _currentRestartDelay;
         private DateTime _lastRestartRequestUtc = DateTime.MinValue;
+        private volatile bool _suppressInput;
+        private readonly SemaphoreSlim _ttsLock = new(1, 1);
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechService" /> class.
         public SpeechService(AppSettings settings, ILogger logger, string callId)
@@ -105,6 +108,11 @@ namespace EchoBot.Media
                 var bufferLength = audioBuffer.Length;
                 if (bufferLength > 0)
                 {
+                    if (_suppressInput)
+                    {
+                        TrackBufferMetrics((int)bufferLength);
+                        return Task.CompletedTask;
+                    }
                     var buffer = new byte[bufferLength];
                     Marshal.Copy(audioBuffer.Data, buffer, 0, (int)bufferLength);
 
@@ -410,21 +418,27 @@ namespace EchoBot.Media
         private async Task TextToSpeech(string text)
         {
             Trace($"TextToSpeech START text=\"{text}\"");
-            // convert the text to speech
-            SpeechSynthesisResult result = await _synthesizer.SpeakTextAsync(text);
-            // take the stream of the result
-            // create 20ms media buffers of the stream
-            // and send to the AudioSocket in the BotMediaStream
-            using (var stream = AudioDataStream.FromResult(result))
+            await _ttsLock.WaitAsync().ConfigureAwait(false);
+            _suppressInput = true;
+            try
             {
-                var currentTick = DateTime.Now.Ticks;
-                MediaStreamEventArgs args = new MediaStreamEventArgs
+                SpeechSynthesisResult result = await _synthesizer.SpeakTextAsync(text).ConfigureAwait(false);
+                using (var stream = AudioDataStream.FromResult(result))
                 {
-                    AudioMediaBuffers = Util.Utilities.CreateAudioMediaBuffers(stream, currentTick, _logger)
-                };
-                OnSendMediaBufferEventArgs(this, args);
+                    var currentTick = DateTime.Now.Ticks;
+                    MediaStreamEventArgs args = new MediaStreamEventArgs
+                    {
+                        AudioMediaBuffers = Util.Utilities.CreateAudioMediaBuffers(stream, currentTick, _logger)
+                    };
+                    OnSendMediaBufferEventArgs(this, args);
+                }
             }
-            Trace("TextToSpeech END");
+            finally
+            {
+                _suppressInput = false;
+                _ttsLock.Release();
+                Trace("TextToSpeech END");
+            }
         }
 
         private void LogRecognizedText(string text)

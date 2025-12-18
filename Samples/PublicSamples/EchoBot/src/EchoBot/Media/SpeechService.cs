@@ -53,11 +53,16 @@ namespace EchoBot.Media
         private TaskCompletionSource<bool> _restartSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private bool _restartPending;
         private bool _hasWelcomed;
+        private bool _userInteracted;
         private long _bufferSampleCount;
         private long _bufferSampleBytes;
         private readonly object _bufferLogLock = new object();
         private DateTime _bufferWindowStartUtc = DateTime.UtcNow;
         private readonly TimeSpan _bufferLogInterval = TimeSpan.FromSeconds(5);
+        private readonly TimeSpan _minRestartDelay = TimeSpan.FromMilliseconds(500);
+        private readonly TimeSpan _maxRestartDelay = TimeSpan.FromSeconds(5);
+        private TimeSpan _currentRestartDelay;
+        private DateTime _lastRestartRequestUtc = DateTime.MinValue;
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechService" /> class.
         public SpeechService(AppSettings settings, ILogger logger, string callId)
@@ -79,6 +84,7 @@ namespace EchoBot.Media
 
             var audioConfig = AudioConfig.FromStreamOutput(_audioOutputStream);
             _synthesizer = new SpeechSynthesizer(_speechConfig, audioConfig);
+            _currentRestartDelay = _minRestartDelay;
             Trace("SpeechService ctor END");
         }
 
@@ -204,6 +210,7 @@ namespace EchoBot.Media
             {
                 await ResetRecognizerAsync().ConfigureAwait(false);
                 _restartPending = false;
+                _currentRestartDelay = _minRestartDelay;
                 Trace("ProcessSpeechLoopAsync END");
             }
         }
@@ -231,6 +238,7 @@ namespace EchoBot.Media
                             if (string.IsNullOrWhiteSpace(recognizedText))
                                 return;
 
+                            _userInteracted = true;
                             _logger.LogInformation($"RECOGNIZED: Text={recognizedText}");
                             LogRecognizedText(recognizedText);
 
@@ -264,6 +272,8 @@ namespace EchoBot.Media
                             }
 
                             await TextToSpeech(speechText);
+                            _currentRestartDelay = _minRestartDelay;
+                            _lastRestartRequestUtc = DateTime.UtcNow;
                         }
                         else if (e.Result.Reason == ResultReason.NoMatch)
                         {
@@ -271,14 +281,15 @@ namespace EchoBot.Media
                         }
                     };
 
-                    _recognizer.Canceled += (s, e) =>
-                    {
-                        _logger.LogInformation($"CANCELED: Reason={e.Reason}");
+            _recognizer.Canceled += (s, e) =>
+            {
+                _logger.LogInformation($"CANCELED: Reason={e.Reason}");
+                Trace($"Recognizer canceled -> Reason={e.Reason}, ErrorCode={(e.Reason == CancellationReason.Error ? e.ErrorCode.ToString() : "None")}, RestartPending={_restartPending}, RecognizerStarted={_recognizerStarted}");
 
-                        if (e.Reason == CancellationReason.Error)
-                        {
-                            _logger.LogInformation($"CANCELED: ErrorCode={e.ErrorCode}");
-                            _logger.LogInformation($"CANCELED: ErrorDetails={e.ErrorDetails}");
+                if (e.Reason == CancellationReason.Error)
+                {
+                    _logger.LogInformation($"CANCELED: ErrorCode={e.ErrorCode}");
+                    _logger.LogInformation($"CANCELED: ErrorDetails={e.ErrorDetails}");
                             _logger.LogInformation("CANCELED: Did you update the subscription info?");
                         }
 
@@ -289,7 +300,7 @@ namespace EchoBot.Media
                     _recognizer.SessionStarted += async (s, e) =>
                     {
                         _logger.LogInformation("\nSession started event.");
-                        if (!_hasWelcomed)
+                        if (!_hasWelcomed && _userInteracted)
                         {
                             _hasWelcomed = true;
                             await TextToSpeech("Hello");
@@ -366,8 +377,34 @@ namespace EchoBot.Media
             }
 
             _restartPending = true;
-            Trace($"Recognizer restart requested ({reason})");
-            _restartSignal.TrySetResult(true);
+            var now = DateTime.UtcNow;
+            var elapsed = now - _lastRestartRequestUtc;
+            if (elapsed < _currentRestartDelay)
+            {
+                var delay = _currentRestartDelay - elapsed;
+                Trace($"Recognizer restart deferred ({reason}) for {delay.TotalMilliseconds:F0}ms");
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(delay).ConfigureAwait(false);
+                        _restartSignal.TrySetResult(true);
+                    }
+                    finally
+                    {
+                        _lastRestartRequestUtc = DateTime.UtcNow;
+                        var doubled = TimeSpan.FromMilliseconds(_currentRestartDelay.TotalMilliseconds * 2);
+                        _currentRestartDelay = doubled > _maxRestartDelay ? _maxRestartDelay : doubled;
+                    }
+                });
+            }
+            else
+            {
+                Trace($"Recognizer restart requested ({reason})");
+                _restartSignal.TrySetResult(true);
+                _lastRestartRequestUtc = now;
+                _currentRestartDelay = _minRestartDelay;
+            }
         }
 
         private async Task TextToSpeech(string text)

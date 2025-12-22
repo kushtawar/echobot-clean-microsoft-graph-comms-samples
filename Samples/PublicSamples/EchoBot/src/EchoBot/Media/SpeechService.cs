@@ -49,6 +49,7 @@ namespace EchoBot.Media
         private AudioConfig _audioInputConfig;
         private bool _recognizerStarted;
         private readonly SpeechSynthesizer _synthesizer;
+        private string _currentVoiceLang = string.Empty;
         private const string DefaultProcessingHint = "Please hold while I check ServiceNow.";
         private Task _speechLoopTask;
         private TaskCompletionSource<bool> _shutdownSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -113,6 +114,7 @@ namespace EchoBot.Media
             _speechConfig = SpeechConfig.FromSubscription(settings.SpeechConfigKey, settings.SpeechConfigRegion);
             _speechConfig.SpeechSynthesisLanguage = settings.BotLanguage;
             _speechConfig.SpeechRecognitionLanguage = settings.BotLanguage;
+            _currentVoiceLang = settings.BotLanguage;
 
             var audioConfig = AudioConfig.FromStreamOutput(_audioOutputStream);
             _synthesizer = new SpeechSynthesizer(_speechConfig, audioConfig);
@@ -299,6 +301,11 @@ namespace EchoBot.Media
                             processingHint = null;
                             if (!string.IsNullOrWhiteSpace(responseBody))
                             {
+                                var voiceLang = TryGetVoiceLang(responseBody);
+                                if (!string.IsNullOrWhiteSpace(voiceLang))
+                                {
+                                    await ApplyVoiceLanguageAsync(voiceLang).ConfigureAwait(false);
+                                }
                                 var formatted = BuildSpeechResponse(responseBody, speechText, out longRunning, out processingHint);
                                 if (!string.IsNullOrWhiteSpace(formatted))
                                 {
@@ -657,6 +664,23 @@ namespace EchoBot.Media
             return null;
         }
 
+        private static string? TryGetVoiceLang(string responseBody)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(responseBody);
+                if (!doc.RootElement.TryGetProperty("result", out var resultElement))
+                {
+                    return null;
+                }
+                return TryGetString(resultElement, "voice_lang");
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
         private enum DictationState
         {
             Idle,
@@ -927,6 +951,24 @@ namespace EchoBot.Media
                 return "your issue";
             }
             return reason;
+        }
+
+        private async Task ApplyVoiceLanguageAsync(string voiceLang)
+        {
+            voiceLang = (voiceLang ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(voiceLang))
+            {
+                return;
+            }
+            if (string.Equals(_currentVoiceLang, voiceLang, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            _currentVoiceLang = voiceLang;
+            _speechConfig.SpeechRecognitionLanguage = voiceLang;
+            _speechConfig.SpeechSynthesisLanguage = voiceLang;
+            RequestRecognizerRestart("VoiceLanguageChanged");
+            await Task.CompletedTask;
         }
 
         private string GetLastSpokenOrFallback()

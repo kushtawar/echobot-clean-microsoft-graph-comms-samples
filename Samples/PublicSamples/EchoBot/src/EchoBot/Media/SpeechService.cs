@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -66,6 +67,31 @@ namespace EchoBot.Media
         private DateTime _lastRestartRequestUtc = DateTime.MinValue;
         private volatile bool _suppressInput;
         private readonly SemaphoreSlim _ttsLock = new(1, 1);
+        private readonly object _dictationLock = new();
+        private DictationState _dictationState = DictationState.Idle;
+        private DateTime _dictationStartUtc;
+        private DateTime _dictationStopUtc;
+        private int _dictationDurationSeconds;
+        private readonly StringBuilder _dictationTranscript = new();
+        private System.Timers.Timer? _dictationTimer;
+
+        private const int DictationMaxSeconds = 60;
+        private const int DictationMinSeconds = 5;
+        private const string DictationStartCommand = "begin lab note";
+        private const string DictationStopCommand = "stop recording";
+        private const string DictationConfirmCommand = "confirm upload";
+        private const string DictationYesCommand = "yes";
+        private const string DictationCancelCommand = "cancel";
+        private const string DictationDiscardCommand = "discard";
+
+        private const string DictationStartPrompt =
+            "Lab note recording started.\nYou may speak now. Maximum duration is one minute.";
+        private const string DictationStopPrompt =
+            "Recording stopped.\nI've prepared a transcript of your note.\nWould you like to share and save it?";
+        private const string DictationSavedPrompt = "Your lab note has been saved successfully.";
+        private const string DictationDiscardPrompt = "Okay. Discarding the note.";
+        private const string DictationTooShortPrompt = "Please continue for a few more seconds.";
+        private const string DictationTranscribeFailedPrompt = "I couldn't transcribe this note. Please retry.";
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechService" /> class.
         public SpeechService(AppSettings settings, ILogger logger, string callId)
@@ -249,6 +275,11 @@ namespace EchoBot.Media
                             _userInteracted = true;
                             _logger.LogInformation($"RECOGNIZED: Text={recognizedText}");
                             LogRecognizedText(recognizedText);
+
+                            if (await TryHandleDictationAsync(recognizedText).ConfigureAwait(false))
+                            {
+                                return;
+                            }
 
                             var holdPromptSpoken = false;
                             if (RequiresSnowIntent(recognizedText))
@@ -617,6 +648,269 @@ namespace EchoBot.Media
                 return prop.GetString();
             }
             return null;
+        }
+
+        private enum DictationState
+        {
+            Idle,
+            Recording,
+            Transcribed
+        }
+
+        private static string NormalizeCommand(string text)
+        {
+            var lower = (text ?? string.Empty).Trim().ToLowerInvariant();
+            lower = Regex.Replace(lower, @"[^a-z0-9\s]", " ");
+            lower = Regex.Replace(lower, @"\s+", " ").Trim();
+            return lower;
+        }
+
+        private async Task<bool> TryHandleDictationAsync(string recognizedText)
+        {
+            var normalized = NormalizeCommand(recognizedText);
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                return false;
+            }
+
+            if (normalized == DictationStartCommand)
+            {
+                await StartDictationAsync().ConfigureAwait(false);
+                return true;
+            }
+
+            lock (_dictationLock)
+            {
+                if (_dictationState == DictationState.Idle)
+                {
+                    return false;
+                }
+            }
+
+            if (normalized == DictationStopCommand)
+            {
+                await StopDictationAsync(isTimeout: false).ConfigureAwait(false);
+                return true;
+            }
+
+            if (normalized == DictationConfirmCommand || normalized == DictationYesCommand)
+            {
+                await ConfirmDictationUploadAsync().ConfigureAwait(false);
+                return true;
+            }
+
+            if (normalized == DictationCancelCommand || normalized == DictationDiscardCommand)
+            {
+                await CancelDictationAsync().ConfigureAwait(false);
+                return true;
+            }
+
+            lock (_dictationLock)
+            {
+                if (_dictationState == DictationState.Recording)
+                {
+                    AppendDictationTranscript(recognizedText);
+                    return true;
+                }
+                if (_dictationState == DictationState.Transcribed)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private async Task StartDictationAsync()
+        {
+            lock (_dictationLock)
+            {
+                if (_dictationState == DictationState.Recording)
+                {
+                    return;
+                }
+                _dictationState = DictationState.Recording;
+                _dictationStartUtc = DateTime.UtcNow;
+                _dictationStopUtc = DateTime.MinValue;
+                _dictationDurationSeconds = 0;
+                _dictationTranscript.Clear();
+                StartDictationTimer();
+            }
+
+            await TextToSpeech(DictationStartPrompt).ConfigureAwait(false);
+        }
+
+        private void StartDictationTimer()
+        {
+            _dictationTimer?.Stop();
+            _dictationTimer?.Dispose();
+            _dictationTimer = new System.Timers.Timer(TimeSpan.FromSeconds(DictationMaxSeconds).TotalMilliseconds)
+            {
+                AutoReset = false
+            };
+            _dictationTimer.Elapsed += async (_, __) =>
+            {
+                await StopDictationAsync(isTimeout: true).ConfigureAwait(false);
+            };
+            _dictationTimer.Start();
+        }
+
+        private async Task StopDictationAsync(bool isTimeout)
+        {
+            DateTime startUtc;
+            lock (_dictationLock)
+            {
+                if (_dictationState != DictationState.Recording)
+                {
+                    return;
+                }
+
+                startUtc = _dictationStartUtc;
+                var elapsed = DateTime.UtcNow - startUtc;
+                if (!isTimeout && elapsed.TotalSeconds < DictationMinSeconds)
+                {
+                    _ = TextToSpeech(DictationTooShortPrompt);
+                    return;
+                }
+
+                _dictationState = DictationState.Transcribed;
+                _dictationStopUtc = DateTime.UtcNow;
+                _dictationDurationSeconds = (int)Math.Round(elapsed.TotalSeconds);
+                _dictationTimer?.Stop();
+            }
+
+            if (_dictationTranscript.Length == 0)
+            {
+                await ResetDictationAsync().ConfigureAwait(false);
+                await TextToSpeech(DictationTranscribeFailedPrompt).ConfigureAwait(false);
+                return;
+            }
+
+            await TextToSpeech(DictationStopPrompt).ConfigureAwait(false);
+        }
+
+        private async Task ConfirmDictationUploadAsync()
+        {
+            string transcript;
+            int durationSeconds;
+            DateTime startedUtc;
+            DateTime timestampUtc;
+
+            lock (_dictationLock)
+            {
+                if (_dictationState != DictationState.Transcribed)
+                {
+                    return;
+                }
+                transcript = _dictationTranscript.ToString().Trim();
+                durationSeconds = _dictationDurationSeconds;
+                startedUtc = _dictationStartUtc;
+                timestampUtc = _dictationStopUtc == DateTime.MinValue ? DateTime.UtcNow : _dictationStopUtc;
+            }
+
+            if (string.IsNullOrWhiteSpace(transcript))
+            {
+                await ResetDictationAsync().ConfigureAwait(false);
+                await TextToSpeech(DictationTranscribeFailedPrompt).ConfigureAwait(false);
+                return;
+            }
+
+            var uploaded = await RelayLabNoteUploadAsync(transcript, durationSeconds, startedUtc, timestampUtc).ConfigureAwait(false);
+            await ResetDictationAsync().ConfigureAwait(false);
+
+            if (uploaded)
+            {
+                await TextToSpeech(DictationSavedPrompt).ConfigureAwait(false);
+            }
+            else
+            {
+                await TextToSpeech("Upload failed. Please try again.").ConfigureAwait(false);
+            }
+        }
+
+        private async Task CancelDictationAsync()
+        {
+            await ResetDictationAsync().ConfigureAwait(false);
+            await TextToSpeech(DictationDiscardPrompt).ConfigureAwait(false);
+        }
+
+        private Task ResetDictationAsync()
+        {
+            lock (_dictationLock)
+            {
+                _dictationState = DictationState.Idle;
+                _dictationTranscript.Clear();
+                _dictationStartUtc = DateTime.MinValue;
+                _dictationStopUtc = DateTime.MinValue;
+                _dictationDurationSeconds = 0;
+                _dictationTimer?.Stop();
+                _dictationTimer?.Dispose();
+                _dictationTimer = null;
+            }
+            return Task.CompletedTask;
+        }
+
+        private void AppendDictationTranscript(string recognizedText)
+        {
+            if (string.IsNullOrWhiteSpace(recognizedText))
+            {
+                return;
+            }
+
+            if (_dictationTranscript.Length > 0)
+            {
+                _dictationTranscript.Append(' ');
+            }
+            _dictationTranscript.Append(recognizedText.Trim());
+        }
+
+        private async Task<bool> RelayLabNoteUploadAsync(string transcript, int durationSeconds, DateTime startedUtc, DateTime timestampUtc)
+        {
+            var endpoint = BuildLabNoteEndpoint();
+            if (string.IsNullOrWhiteSpace(endpoint))
+            {
+                _logger.LogWarning("Lab note upload skipped: VoiceSttEndpoint is not configured.");
+                return false;
+            }
+
+            try
+            {
+                var payload = new
+                {
+                    transcript = transcript,
+                    durationSeconds = durationSeconds,
+                    startTimeUtc = startedUtc.ToUniversalTime().ToString("o"),
+                    timestampUtc = timestampUtc.ToUniversalTime().ToString("o"),
+                    callId = _callId
+                };
+
+                using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+                using var response = await _httpClient.PostAsync(endpoint, content).ConfigureAwait(false);
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                await LogVoiceSttResponseAsync(response.IsSuccessStatusCode, body);
+                return response.IsSuccessStatusCode;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to call /voice/labnote endpoint.");
+                return false;
+            }
+        }
+
+        private string? BuildLabNoteEndpoint()
+        {
+            var sttEndpoint = _settings?.VoiceSttEndpoint;
+            if (string.IsNullOrWhiteSpace(sttEndpoint))
+            {
+                return null;
+            }
+
+            if (sttEndpoint.EndsWith("/voice/stt", StringComparison.OrdinalIgnoreCase))
+            {
+                return sttEndpoint[..^"/voice/stt".Length] + "/voice/labnote";
+            }
+
+            return sttEndpoint.TrimEnd('/') + "/voice/labnote";
         }
 
         private static string ReasonOrFallback(string? reason)
